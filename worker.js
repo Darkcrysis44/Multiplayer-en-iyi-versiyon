@@ -1,6 +1,6 @@
 const MAX_PLAYERS = 4;
-const TICK_MS = 50;       // 20 Hz authoritative simulation
-const STATE_MS = 50;      // 20 Hz snapshots: smoother remote world at higher latency
+const TICK_MS = 8;        // ~120 Hz authoritative simulation (ultra smooth co-op)
+const STATE_MS = 16;      // ~60 Hz snapshots; client prediction covers the rest
 const WIDTH = 1200, HEIGHT = 700;
 const TYPES = {
   broken:[.55,1,1,21,'Broken Heart','Common'], charger:[.10,.8,1.8,19,'Heart Charger','Uncommon'],
@@ -82,6 +82,7 @@ export class Room {
       return;
     }
     if(m.type==='restartRequest' && this.phase==='gameover' && this.players.size>=1){
+      if(m.stats)this.setStats(p,m.stats);
       this.phase='countdown';this.enemies=[];this.spawned=0;this.wave=1;this.picks.clear();this.offer=null;this.countdownAt=Date.now()+1200;
       for(const q of this.players.values()){q.x=WIDTH/2;q.y=HEIGHT/2;q.hp=q.maxHp;q.downed=false;q.reviveProgress=0;q.ix=0;q.iy=0;q.lastAttack=0}
       this.broadcast({type:'serverRestart',startAt:this.countdownAt,serverNow:Date.now()});this.broadcastState(true);return;
@@ -95,6 +96,7 @@ export class Room {
       if(p.downed){p.ix=0;p.iy=0;return}
       p.ix=clamp(Number(m.x)||0,-1,1);p.iy=clamp(Number(m.y)||0,-1,1);return;
     }
+    if(m.type==='weaponChange' && !p.downed){p.weapon=String(m.weapon||'sword')==='bow'?'bow':'sword';this.broadcastState(true);return;}
     if(m.type==='attack' && this.phase==='battle' && !p.downed){this.serverAttack(p,m);return;}
     if(m.type==='skill' && this.phase==='battle' && !p.downed){this.serverSkill(p,m);return;}
     if(m.type==='upgradePick' && this.phase==='upgrade' && this.offer && m.offerId===this.offer.id && !this.picks.has(id)){
@@ -146,14 +148,28 @@ name:type==='boss'?BOSS_DEFS[(Math.floor(this.wave/5)-1)%BOSS_DEFS.length].name:
     p.progressRev++;
     return leveled;
   }
-  progression(p){return {level:p.level||1,xp:p.xp||0,rebirths:p.rebirths||0,mult:p.mult||1,progressRev:p.progressRev||0,stats:{maxHp:p.maxHp,atk:p.atk,spd:p.spd,armor:p.armor,crit:p.crit}}}
+  progression(p){return {level:p.level||1,xp:p.xp||0,rebirths:p.rebirths||0,mult:p.mult||1,progressRev:p.progressRev||0}}
   killEnemy(e,owner){
     if(!e||!this.enemies.some(x=>x.id===e.id))return;
     const reward=e.boss?80+this.wave*8:3+Math.floor(this.wave*.9);
     const xp=(e.boss?180:25)+this.wave*6;
     this.enemies=this.enemies.filter(x=>x.id!==e.id);
     const p=owner?this.players.get(owner):null;
-    if(p){this.awardXp(p,xp);this.send(owner,{type:'reward',reward,xp,progression:this.progression(p)});}
+    if(p){
+      // Killer gets full reward
+      this.awardXp(p,xp);
+      this.send(owner,{type:'reward',reward,xp,progression:this.progression(p)});
+      
+      // Other alive players get 75% of the reward
+      const sharedReward=Math.floor(reward*0.75);
+      const sharedXp=Math.floor(xp*0.75);
+      for(const [id,player] of this.players){
+        if(id!==owner && !player.downed){
+          this.awardXp(player,sharedXp);
+          this.send(id,{type:'reward',reward:sharedReward,xp:sharedXp,progression:this.progression(player)});
+        }
+      }
+    }
   }
   serverSkill(p,m){
     const now=Date.now();
@@ -204,7 +220,7 @@ name:type==='boss'?BOSS_DEFS[(Math.floor(this.wave/5)-1)%BOSS_DEFS.length].name:
     this.broadcastState(true);
   }
   serverAttack(p,m){
-    const now=Date.now();if(now-p.lastAttack<500)return;p.lastAttack=now;
+    const now=Date.now();if(now-p.lastAttack<450)return;p.lastAttack=now;
     const weapon=m.weapon==='bow'?'bow':'sword';p.weapon=weapon;
     const angle=Number.isFinite(Number(m.angle))?Number(m.angle):p.angle;p.angle=angle;
     if(weapon==='bow'){
@@ -218,7 +234,7 @@ name:type==='boss'?BOSS_DEFS[(Math.floor(this.wave/5)-1)%BOSS_DEFS.length].name:
       return;
     }
     let best=null,bestAlong=Infinity;
-    const maxRange=125,hitWidth=52,ca=Math.cos(angle),sa=Math.sin(angle);
+    const maxRange=135,hitWidth=48,ca=Math.cos(angle),sa=Math.sin(angle);
     for(const e of this.enemies){
       const rx=e.x-p.x,ry=e.y-p.y,along=rx*ca+ry*sa;
       if(along<0||along>maxRange)continue;
@@ -353,7 +369,7 @@ name:type==='boss'?BOSS_DEFS[(Math.floor(this.wave/5)-1)%BOSS_DEFS.length].name:
       if(!target)continue;
       const dx=target.x-e.x,dy=target.y-e.y,d=Math.hypot(dx,dy)||1,contact=e.boss?72:46;
       if(!e.dashT&&!e.chargeT&&d>contact){e.x+=dx/d*e.speed*60*dt;e.y+=dy/d*e.speed*60*dt}
-      else{e.attack-=dt;if(e.attack<=0){e.attack=e.boss?1.5:.9;const dmg=Math.max(1,e.atk-target.armor*.7);target.hp=Math.max(0,target.hp-dmg);if(target.hp<=0){target.hp=0;target.downed=true;target.reviveProgress=0;target.ix=0;target.iy=0;this.broadcast({type:'downed',playerId:target.id,x:target.x,y:target.y})}}}
+      else{e.attack-=dt;if(e.attack<=0){e.attack=e.boss?1.5:.9;const dmg=Math.max(1,e.atk-target.armor*.7);target.hp=Math.max(0,target.hp-dmg);this.broadcast({type:'enemyAttack',enemyId:e.id,playerId:target.id,damage:dmg,x:target.x,y:target.y,serverNow:now});if(target.hp<=0){target.hp=0;target.downed=true;target.reviveProgress=0;target.ix=0;target.iy=0;this.broadcast({type:'downed',playerId:target.id,x:target.x,y:target.y})}}}
       e.x=clamp(e.x,-60,WIDTH+60);e.y=clamp(e.y,-60,HEIGHT+60);e.hit=Math.max(0,e.hit-dt);
     }
     const targetCount=this.wave%5===0?1:this.wave*3+4;
